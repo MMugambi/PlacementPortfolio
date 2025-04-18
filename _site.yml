@@ -5,8 +5,23 @@ description: |
 output_dir: "_site"
 navbar:
   right:
-    - text: "Home"
-      href: index.html
+ #   - text: "Home"
+ #     href: index.html
     - text: "About"
       href: about.html
+    - text: "Portfolio"
+      href: Portfolio.html
+      menu:
+      - text: "Introduction"
+        href: Portfolio.html
+      - text: "Logistic Regression"
+        href: Portfolio.html#logistic-regression
+      - text: "Multiple Linear Regression"
+        href: Portfolio.html#multiple-linear-regression-mlr
+      - text: "Multinomial Regression"
+        href: Portfolio.html#multinomial-regression
+      - text: "Linear Discriminant Analysis"
+        href: Portfolio.html#linear-discriminant-analysis
+      - text: "Polynomial Regression"
+        href: Portfolio.html#polynomial-regression
 output: distill::distill_article

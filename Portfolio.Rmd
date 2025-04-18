@@ -1,9 +1,9 @@
 ---
 title: "Portfolio"
-author: "Mugambi"
-date: "2025-04-12"
-output:
-  rmdformats::readthedown
+author:
+  - name: "Timothy Mugambi"
+date: "`r Sys.Date()`"
+output: distill::distill_article
   #rmdformats::material: default
 ---
 
@@ -32,8 +32,7 @@ library(MASS)
 library(effects)
 library(vip)
 library(car)
-#library(gitcreds)
-#gitcreds::gitcreds_set()
+
 ```
 
 
@@ -116,7 +115,6 @@ miss_var_summary(job)
 ```{r}
 gg_miss_var(job)
 ```
-
 From this we only have one missing value from `years_of_experience` column. The missing value has a percentage of 0.143 with less significant to the dataset if dropped, therefore we will drop the missing values from the column
 ```{r}
 job <- job %>%
