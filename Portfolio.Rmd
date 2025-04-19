@@ -32,6 +32,10 @@ library(MASS)
 library(effects)
 library(vip)
 library(car)
+library(workflows)
+library(tune)
+library(dials)
+library(yardstick)
 
 ```
 
@@ -318,575 +322,624 @@ job_split <- initial_split(data_mod, prop = 0.8, strata = placement)
 train_data <- training(job_split)
 test_data <- testing(job_split)
 
-predictors <- c("age", "gpa", "years_of_experience", "college_tier", 
-               "gender_Female", "gender_Male",
-               "stream_Computer.Science", "stream_Electrical.Engineering", 
-               "stream_Electronics.and.Communication", "stream_Information.Technology", 
-               "stream_Mechanical.Engineering")
 
-train_data$placement <- as.factor(train_data$placement)
-test_data$placement <- as.factor(test_data$placement)
-```
+train_data <- train_data %>% mutate(placement = factor(placement))
+test_data <- test_data %>% mutate(placement = factor(placement))
 
-We start with the full model
-```{r}
-full_formula <- as.formula(paste("placement ~", paste(predictors, collapse = " + ")))
-full_model <- glm(full_formula, family = binomial, data = train_data)
-summary(full_model)
-```
-### Create null model with just intercept
-```{r}
-null_model <- glm(placement ~ 1, family = binomial, data = train_data)
-#summary(null_model)
-```
+job_recipe <- recipe(placement ~ ., data = train_data) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_normalize(all_numeric_predictors())
 
+log_reg_spec <- logistic_reg() %>%
+  set_engine("glm") %>%
+  set_mode("classification")
 
-## Backward Selection
-```{r}
-cat("\n*** PERFORMING BACKWARD SELECTION ***\n")
-backward_model <- stepAIC(full_model, direction = "backward", 
-                          trace = TRUE, k = 2)
-backward_summary <- summary(backward_model)
+# Create a workflow
+log_reg_wf <- workflow() %>%
+  add_recipe(job_recipe) %>%
+  add_model(log_reg_spec)
 
-```
+# Fit the model
+final_fit <- log_reg_wf %>%
+  fit(data = train_data)
 
-## Forward Selection
-```{r}
-cat("\n*** PERFORMING FORWARD SELECTION ***\n")
-forward_model <- stepAIC(null_model, 
-                         scope = list(lower = formula(null_model), 
-                                     upper = formula(full_model)),
-                         direction = "forward", 
-                         trace = TRUE, k = 2)
-forward_summary <- summary(forward_model)
-#print(forward_summary)
+final_model <- extract_fit_parsnip(final_fit)
+tidy_model <- tidy(final_model) %>%
+  mutate(p_significant = p.value < 0.05) %>%
+  arrange(p.value)
 
-```
-## Stepwise Selection
-```{r}
-cat("\n*** PERFORMING STEPWISE SELECTION ***\n")
-stepwise_model <- stepAIC(null_model, 
-                          scope = list(lower = formula(null_model), 
-                                      upper = formula(full_model)),
-                          direction = "both", 
-                          trace = TRUE, k = 2)
-stepwise_summary <- summary(stepwise_model)
+print("Model Coefficients:")
+print(tidy_model)
+
+test_preds <- augment(final_fit, test_data)
+
+test_metrics <- test_preds %>%
+  metrics(truth = placement, estimate = .pred_class, .pred_1)
+print("Test set performance metrics:")
+print(test_metrics)
 
 ```
 
-
-## Comparing the different selection Techniques
-```{r}
-aic_comparison <- data.frame(
-  Model = c("Full Model", "Backward Selection", "Forward Selection", "Stepwise Selection"),
-  AIC = c(AIC(full_model), AIC(backward_model), AIC(forward_model), AIC(stepwise_model))
-)
-print(aic_comparison)
-```
-The Full Model has the highest AIC value (429.6968), suggesting it's the least optimal approach among those tested. This likely indicates that the full model may be overfit or includes variables that don't contribute meaningfully to predictive power.
-Backward Selection shows improvement with an AIC of 424.2939, indicating that removing certain variables from the full model improved the balance between fit and complexity.
-Forward Selection and Stepwise Selection both achieved the lowest and identical AIC values (423.9430), suggesting these approaches identified the most optimal set of predictors. These methods appear to have converged on the same final model.
-The nearly identical results between Forward and Stepwise Selection suggest that starting from different points  led to the same optimal variable set, which strengthens confidence in this model specification.
-
-**Visualizing AIC Comparison**
-```{r}
-ggplot(aic_comparison, aes(x = reorder(Model, AIC), y = AIC)) +
-  geom_bar(stat = "identity", fill = "steelblue") +
-  coord_flip() +
-  labs(title = "Model Comparison by AIC",
-       x = "Model",
-       y = "AIC (lower is better)") +
-  theme_minimal()
-```
-
-
-## Extracting Important features
-```{r}
-get_model_vars <- function(model) {
-  vars <- names(coef(model))
-  vars <- vars[vars != "(Intercept)"]
-  return(vars)
-}
-
-backward_vars <- get_model_vars(backward_model)
-forward_vars <- get_model_vars(forward_model)
-stepwise_vars <- get_model_vars(stepwise_model)
-full_vars <- get_model_vars(full_model)
-
-# Create comparison of selected variables
-all_vars <- unique(c(full_vars, backward_vars, forward_vars, stepwise_vars))
-
-var_selection <- data.frame(
-  Variable = all_vars,
-  Full = all_vars %in% full_vars,
-  Backward = all_vars %in% backward_vars,
-  Forward = all_vars %in% forward_vars,
-  Stepwise = all_vars %in% stepwise_vars
-)
-```
-
-## Visualizing variable 
-```{r}
-var_selection_long <- var_selection %>%
-  pivot_longer(cols = c(Full, Backward, Forward, Stepwise),
-               names_to = "Model",
-               values_to = "Selected") %>%
-  mutate(Selected = ifelse(Selected, "Yes", "No"))
-
-ggplot(var_selection_long, aes(x = Variable, y = Model, fill = Selected)) +
-  geom_tile() +
-  scale_fill_manual(values = c("white", "steelblue")) +
-  labs(title = "Feature Selection Comparison",
-       x = "Variable",
-       y = "Selection Method") +
-  theme_minimal() +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1))
-```
-Both Forward and Stepwise selection methods chose identical features, which explains the identical AIC values (423.9430). Backward Selection retained more features than Forward or stepwise selection methods. We had certain features appear in all selection methods i.e `stream_Computer Science`, `years_of_experience`, suggesting these are highly significant predictors for the model.
-
-## Model Evaluation on Test Data
-```{r}
-evaluate_model <- function(model, test_data, model_name) {
-  probs <- predict(model, newdata = test_data, type = "response")
-  preds <- ifelse(probs > 0.5, 1, 0)
-  preds <- factor(preds, levels = levels(test_data$placement))
-  
-  conf_mat <- confusionMatrix(preds, test_data$placement)
-  
-  return(data.frame(
-    Model = model_name,
-    Accuracy = conf_mat$overall["Accuracy"],
-    Sensitivity = conf_mat$byClass["Sensitivity"],
-    Specificity = conf_mat$byClass["Specificity"],
-    F1 = conf_mat$byClass["F1"]
-  ))
-}
-
-model_eval <- bind_rows(
-  evaluate_model(full_model, test_data, "Full Model"),
-  evaluate_model(backward_model, test_data, "Backward Selection"),
-  evaluate_model(forward_model, test_data, "Forward Selection"),
-  evaluate_model(stepwise_model, test_data, "Stepwise Selection")
-)
-
-print(model_eval)
-```
-The accuracy of the models are within the same range. I would chooose the forward selection model with an accuracy of `0.786`. This model is conceptually simpler and more computationally efficient 
-```{r}
-model_eval_long <- model_eval %>%
-  pivot_longer(cols = c(Accuracy, Sensitivity, Specificity, F1),
-               names_to = "Metric",
-               values_to = "Value")
-
-ggplot(model_eval_long, aes(x = Model, y = Value, fill = Metric)) +
-  geom_bar(stat = "identity", position = "dodge") +
-  labs(title = "Performance Comparison of Feature Selection Methods",
-       x = "Model",
-       y = "Value") +
-  scale_fill_brewer(palette = "Set1") +
-  ylim(0, 1) +
-  theme_minimal() +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1))
-```
-```{r}
-tidy(forward_model, conf.int = TRUE)
-
-```
-
-`Years of experience` is highly significant (p-value = 3.40e-13) with a positive coefficient of 2.64, indicating that each additional year of experience increases the outcome by approximately 2.64 units, holding other variables constant. This is the most statistically significant predictor in the model.
-`GPA` has a significant negative relationship (p-value = 8.41e-04) with a coefficient of -5.22. This unexpected negative relationship suggests that, controlling for other factors, higher GPAs are associated with lower outcomes. `Stream_Computer Science` shows a significant negative effect (p-value = 0.03) with a coefficient of -0.57, suggesting this stream may have slightly worse outcomes compared to the reference stream.
-`Stream_Electronics` and `Communication` is marginally significant (p-value = 0.054, just above the conventional 0.05 threshold) with a positive coefficient of 0.87, suggesting potentially better outcomes compared to the reference stream.
-`College tier variables (college_tier_L and college_tier_Q)` show very high p-values (0.986 and 0.982) and are not statistically significant predictors in this model.
-
-We will drop `college_tier` from the model
-
-## Final Model
-```{r}
-fin_model <- glm(formula = placement ~ years_of_experience  + 
-    gpa + stream_Computer.Science + stream_Electronics.and.Communication, 
-    family = binomial, data = train_data)
-tidy(fin_model)
-```
-
-```{r}
-plot(fin_model)
-```
-From the residuals vs fitted values plot **linearity assumption** appears to be violated as there is a visible pattern in the residuals rather than random scatter around the horizontal line at zero. This non-random pattern suggests the model may be missing important predictors or transformations. **Homoscedasticity assumption** (constant variance of errors) also appears to be violated due to the increasing spread of residuals at higher fitted values, with larger negative residuals appearing as the fitted values increase
-
+Years of professional experience stands as the significant predictor of job placement success, with a strong positive coefficient that far outweighs other factors. Surprisingly, GPA demonstrates a negative relationship with placement outcomes, challenging conventional assumptions about academic performance as a primary hiring criterion
+The various academic streams (Electronics and Communication, Information Technology, Computer Science, and Electrical Engineering), gender, and college tier did not demonstrate statistically significant relationships with the outcome.
 
 ## 2. Multiple Linear Regression (MLR)
+
 ```{r}
-job_mlr <- job_processed
-job_mlr$placement_numeric <- as.numeric(job_mlr$placement) - 1
+data_mod <- job_processed %>%
+  dplyr::select(-college_name) %>% 
+  dplyr::select(salary, age, gpa, years_of_experience, college_tier, 
+                starts_with("gender_"), starts_with("stream_"))
 
 set.seed(2025)
-train_index <- createDataPartition(job_mlr$placement_numeric, p = 0.8, list = FALSE)
-train_data <- job_mlr[train_index, ]
-test_data <- job_mlr[-train_index, ]
+job_split <- initial_split(data_mod, prop = 0.8)
+train_data <- training(job_split)
+test_data <- testing(job_split)
 
-mlr_model <- lm(placement_numeric ~ age + gpa + years_of_experience + 
-                college_tier + gender_Female + 
-                stream_Computer.Science + stream_Electrical.Engineering +
-                stream_Electronics.and.Communication + stream_Information.Technology,
-                data = train_data)
+job_recipe <- recipe(salary ~ ., data = train_data) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_normalize(all_numeric_predictors())
 
-tidy(mlr_model)
+lin_reg_spec <- linear_reg() %>%
+  set_engine("lm") %>%
+  set_mode("regression")
 
-vif_values <- vif(mlr_model)
-print("Variance Inflation Factors:")
-print(vif_values)
+lin_reg_wf <- workflow() %>%
+  add_recipe(job_recipe) %>%
+  add_model(lin_reg_spec)
 
+final_fit <- lin_reg_wf %>%
+  fit(data = train_data)
+
+final_model <- extract_fit_parsnip(final_fit)
+tidy_model <- tidy(final_model) %>%
+  mutate(p_significant = p.value < 0.05) %>%
+  arrange(p.value)
+
+print("Model Coefficients:")
+print(tidy_model)
+print(paste("Model R-squared:", glance(final_model)$r.squared))
+print(paste("Model Adjusted R-squared:", glance(final_model)$adj.r.squared))
+
+test_preds <- augment(final_fit, test_data)
+
+test_metrics <- test_preds %>%
+  metrics(truth = salary, estimate = .pred)
+print("Test set performance metrics:")
+print(test_metrics)
+
+# Visualize predictions vs actual values
+prediction_plot <- ggplot(test_preds, aes(x = salary, y = .pred)) +
+  geom_point(alpha = 0.5) +
+  geom_abline(color = "blue") +
+  labs(
+    title = "Predicted vs Actual Salary",
+    x = "Actual Salary",
+    y = "Predicted Salary"
+  ) +
+  theme_minimal()
+print(prediction_plot)
+
+# Variable importance plot
+var_importance <- tidy_model %>%
+  filter(term != "(Intercept)") %>%
+  mutate(
+    importance = abs(estimate)
+  ) %>%
+  # Convert term to factor first, then reorder
+  mutate(term = factor(term)) %>%
+  mutate(term = forcats::fct_reorder(term, importance)) %>%
+  ggplot(aes(x = importance, y = term, fill = p_significant)) +
+  geom_col() +
+  scale_fill_manual(values = c("grey70", "royalblue")) +
+  labs(
+    title = "Variable Importance in MLR Model",
+    x = "Absolute Standardized Coefficient",
+    y = NULL,
+    fill = "Statistically\nSignificant"
+  )
+print(var_importance)
+
+residual_plot <- ggplot(test_preds, aes(x = .pred, y = salary - .pred)) +
+  geom_point() +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  labs(
+    title = "Residual Plot",
+    x = "Predicted Salary",
+    y = "Residuals (Actual - Predicted)"
+  ) +
+  theme_minimal()
+print(residual_plot)
 ```
-From the results in our `Variation Infation Factor` we can see that multicollinearity is not a significant concern among the predictors in the model.
+The R² value of 0.194 indicates that our model explains only 19.4% of the variance in the outcome variable. This relatively low explanatory power suggests that important factors may be missing from our current model. To potentially improve model performance while managing potential multicollinearity, we will implement Ridge regression as an alternative approach.
 
-`Years of experience` is a strong predictor with a highly significant positive coefficient (0.217, p < 0.001), indicating that each additional year of experience substantially increases placement probability. College tier Q also shows a significant positive effect (0.180, p < 0.01), suggesting graduates from higher-tier institutions have better placement outcomes. Similarly, Electronics and Communication stream demonstrates a positive significant relationship with placement (0.120, p < 0.05). Interestingly, GPA shows a negative coefficient (-0.242) but isn't statistically significant (p = 0.232), suggesting academic performance may not directly translate to employment success when controlling for other factors. Variables like age, gender, and most academic streams (Computer Science, Electrical Engineering) show minimal impact with non-significant coefficients
-`age`, `gpa`, `gender_female`, `Stream_Computer.Science`, `Stream_Electrical.Engineering` are not statistically significant to the model so we drop them
 
-###Final MLR Model
+## Ridge Regression
+```{r}
+library(glmnet)
+
+ridge_spec <- linear_reg(penalty = 0.1, mixture = 0) %>%
+  set_engine("glmnet") %>%
+  set_mode("regression")
+
+ridge_wf <- workflow() %>%
+  add_recipe(job_recipe) %>%
+  add_model(ridge_spec)
+
+ridge_fit <- ridge_wf %>%
+  fit(data = train_data)
+
+ridge_preds <- augment(ridge_fit, test_data)
+ridge_metrics <- ridge_preds %>%
+  metrics(truth = salary, estimate = .pred)
+print(ridge_metrics)
+```
+Comparing our original model (R² = 0.194) with the Ridge regression results (R² = 0.162), we observe that Ridge regression actually reduced the explanatory power slightly while potentially addressing multicollinearity. The low explanatory power in both models (explaining less than 20% of variance) suggests that important factors or relationships may be missing from our current specifications. To potentially improve model performance, we will investigate interaction terms between predictors. 
+
+## Interaction terms
+These interaction effects could reveal more complex relationships that our current linear models are unable to capture, potentially leading to improved explanatory power and more nuanced insights about the factors influencing our outcome variable.
 
 ```{r}
-mlr_model <- lm(placement_numeric ~ 
-                      years_of_experience + 
-                      college_tier + 
-                      stream_Electronics.and.Communication,
-                      data = train_data)
-tidy(mlr_model)
+library(forcats)
+
+data_mod <- job_processed %>%
+  dplyr::select(-college_name) %>% 
+  dplyr::select(salary, age, gpa, years_of_experience, college_tier, 
+                starts_with("gender_"), starts_with("stream_"))
+
+set.seed(2025)
+
+job_split <- initial_split(data_mod, prop = 0.8)
+train_data <- training(job_split)
+test_data <- testing(job_split)
+
+# Create interaction formula components
+interaction_formula <- as.formula(
+  "salary ~ . + gpa:years_of_experience + age:years_of_experience + gpa:college_tier"
+)
+
+lin_reg_spec <- linear_reg() %>%
+  set_engine("lm") %>%
+  set_mode("regression")
+
+lin_reg_wf <- workflow() %>%
+  add_formula(interaction_formula) %>%
+  add_model(lin_reg_spec)
+
+final_fit <- lin_reg_wf %>%
+  fit(data = train_data)
+
+final_model <- extract_fit_parsnip(final_fit)
+
+tidy_model <- tidy(final_model) %>%
+  mutate(p_significant = p.value < 0.05) %>%
+  arrange(p.value)
+
+print("Model Coefficients with Interaction Terms:")
+print(tidy_model)
+print(paste("Model R-squared:", glance(final_model)$r.squared))
+print(paste("Model Adjusted R-squared:", glance(final_model)$adj.r.squared))
+
+# Make predictions on test data
+test_preds <- predict(final_fit, test_data) %>%
+  bind_cols(test_data)
+
+# Calculate test metrics
+test_metrics <- test_preds %>%
+  metrics(truth = salary, estimate = .pred)
+
+print("Test set performance metrics:")
+print(test_metrics)
+
+# Visualize predictions vs actual values
+prediction_plot <- ggplot(test_preds, aes(x = salary, y = .pred)) +
+  geom_point(alpha = 0.5) +
+  geom_abline(color = "blue") +
+  labs(
+    title = "Predicted vs Actual Salary (with Interaction Terms)",
+    x = "Actual Salary",
+    y = "Predicted Salary"
+  ) +
+  theme_minimal()
+
+print(prediction_plot)
+
+# Variable importance plot
+var_importance <- tidy_model %>%
+  filter(term != "(Intercept)") %>%
+  mutate(
+    importance = abs(estimate)
+  ) %>%
+  # Convert term to factor first, then reorder
+  mutate(term = factor(term)) %>%
+  mutate(term = forcats::fct_reorder(term, importance)) %>%
+  ggplot(aes(x = importance, y = term, fill = p_significant)) +
+  geom_col() +
+  scale_fill_manual(values = c("grey70", "royalblue")) +
+  labs(
+    title = "Variable Importance in MLR Model with Interactions",
+    x = "Absolute Standardized Coefficient",
+    y = NULL,
+    fill = "Statistically\nSignificant"
+  )
+
+print(var_importance)
+
+# Check residuals
+residual_plot <- ggplot(test_preds, aes(x = .pred, y = salary - .pred)) +
+  geom_point() +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  labs(
+    title = "Residual Plot (Model with Interaction Terms)",
+    x = "Predicted Salary",
+    y = "Residuals (Actual - Predicted)"
+  ) +
+  theme_minimal()
+
+
 ```
 
+The introduction of interaction terms has significantly enhanced our model's explanatory power, with the R² increasing from 19.4% in the original model to 32.8% (adjusted R² of 31.1%). This substantial improvement reveals complex relationships between predictors that weren't captured in the simpler models. The significant interaction between GPA and college tier (p < 0.0001) indicates that the impact of academic performance varies meaningfully across different institution types. Additionally, Electronics and Communication stream emerged as significant in this expanded model (p = 0.007), while years of experience maintained its significance (p = 0.02). The interaction approach uncovered nuanced relationships between educational factors and experience that the original and Ridge regression models failed to detect. These findings suggest that the effect of academic credentials on the outcome variable is not uniform but rather dependent on institutional quality and potentially moderated by professional experience, providing more sophisticated insights for decision-making in this context.
 
-**Making predictions on test data and evaluating perfomance**
-```{r}
-mlr_predictions_prob <- predict(mlr_model, newdata = test_data)
-mlr_predictions_prob <- pmin(pmax(mlr_predictions_prob, 0), 1)  
-mlr_predictions <- ifelse(mlr_predictions_prob > 0.5, 1, 0)
-
-mlr_accuracy <- mean(mlr_predictions == test_data$placement_numeric)
-print(paste("MLR Accuracy:", round(mlr_accuracy, 4)))
-```
-This accuracy rate of 81.29% shows a strong predictive performance for job placement outcomes, indicating the reduced model with just three significant predictors (years of experience, college tier Q, and Electronics and Communication stream) effectively captures the key factors influencing employment success
-
-
-## Model Diagnostics
-```{r}
-plot(mlr_model)
-```
-The plot shows a clear pattern in the residuals rather than random scatter around the horizontal line at zero, indicating a violation of the linearity assumption. There's a visible downward trend from left to right, suggesting the relationship between predictors and placement might be nonlinear. The spread of residuals is inconsistent across fitted values (heteroscedasticity), with greater variance at lower fitted values and more compression at higher fitted values. This uneven spread violates the assumption of constant variance. 
 
 ## 3. Multinomial Regression
 
 ### Research Question 2
 **What factors best predict the starting salary of placed graduates?**
 
-
 ```{r}
-library(nnet)
 placed_grads <- job_processed %>% filter(placement == 1)
 
-set.seed(123)
+set.seed(2025)
 salary_split <- initial_split(placed_grads, prop = 0.8)
 salary_train <- training(salary_split)
 salary_test <- testing(salary_split)
 
+train_low_threshold <- quantile(salary_train$salary, 0.33)
+train_high_threshold <- quantile(salary_train$salary, 0.66)
+
+# Create salary categories 
 salary_train <- salary_train %>%
   mutate(salary_category = case_when(
-    salary < quantile(salary, 0.33) ~ "low",
-    salary >= quantile(salary, 0.33) & salary < quantile(salary, 0.66) ~ "medium",
-    salary >= quantile(salary, 0.66) ~ "high"
-  ))
+    salary < train_low_threshold ~ "low",
+    salary >= train_low_threshold & salary < train_high_threshold ~ "medium",
+    salary >= train_high_threshold ~ "high"
+  ) %>% factor())
 
 salary_test <- salary_test %>%
   mutate(salary_category = case_when(
-    salary < quantile(salary_train$salary, 0.33) ~ "low",
-    salary >= quantile(salary_train$salary, 0.33) & salary < quantile(salary_train$salary, 0.66) ~ "medium",
-    salary >= quantile(salary_train$salary, 0.66) ~ "high"
-  ))
+    salary < train_low_threshold ~ "low",
+    salary >= train_low_threshold & salary < train_high_threshold ~ "medium",
+    salary >= train_high_threshold ~ "high"
+  ) %>% factor())
 
-# Convert to factor
-salary_train$salary_category <- factor(salary_train$salary_category)
-salary_test$salary_category <- factor(salary_test$salary_category)
+multinom_spec <- multinom_reg() %>%
+  set_engine("nnet", maxit = 1000) %>%
+  set_mode("classification")
 
-# Fit multinomial model with all features
-full_model <- multinom(salary_category ~ gpa + years_of_experience + 
-                         gender_Female + gender_Male + 
-                         stream_Computer.Science + stream_Electrical.Engineering + 
-                         stream_Electronics.and.Communication + stream_Information.Technology + 
-                         stream_Mechanical.Engineering + 
-                         college_tier, 
-                       data = salary_train, 
-                       maxit = 1000)
+full_model_fit <- multinom_spec %>%
+  fit(
+    salary_category ~ gpa + years_of_experience + 
+      gender_Female + gender_Male + 
+      stream_Computer.Science + stream_Electrical.Engineering + 
+      stream_Electronics.and.Communication + stream_Information.Technology + 
+      stream_Mechanical.Engineering + 
+      college_tier,
+    data = salary_train
+  )
 
-summary(full_model)
+tidy(full_model_fit)
 
-```
-### Making predictions on the test data
-```{r}
-test_predictions <- predict(full_model, newdata = salary_test)
-confusion_matrix <- confusionMatrix(test_predictions, salary_test$salary_category)
-#print(confusion_matrix)
+# Make predictions on test data
+test_predictions <- full_model_fit %>%
+  predict(new_data = salary_test) %>%
+  pull(.pred_class)
 
 
-```
-## Calculate variable importance
 
-```{r}
-
-#coefficients <- coef(full_model)
-#print(coefficients)
-
+# Cross-validation 
 set.seed(2025)
-train_control <- trainControl(method = "cv", number = 5, classProbs = TRUE)
-caret_model <- train(
+salary_folds <- vfold_cv(salary_train, v = 5)
+
+cv_results <- fit_resamples(
+  multinom_spec,
   salary_category ~ gpa + years_of_experience + 
     gender_Female + gender_Male + 
     stream_Computer.Science + stream_Electrical.Engineering + 
     stream_Electronics.and.Communication + stream_Information.Technology + 
     stream_Mechanical.Engineering + 
     college_tier,
-  data = salary_train,
-  method = "multinom",
-  trControl = train_control,
-  trace = FALSE
+  resamples = salary_folds,
+  metrics = metric_set(accuracy, roc_auc),
+  control = control_resamples(save_pred = TRUE)
 )
 
-var_imp <- varImp(caret_model)
-print(var_imp)
-plot(var_imp)
+collect_metrics(cv_results)
+
+
+
+final_model_fit <- multinom_spec %>%
+  fit(
+    salary_category ~ gpa + years_of_experience + college_tier,
+    data = salary_train
+  )
+
+final_predictions <- final_model_fit %>%
+  predict(new_data = salary_test) %>%
+  pull(.pred_class)
 
 ```
-
-The important features for this model are `gender_female`, `gender_male`, `gpa`, `college_tier`.
-```{r}
-final_model <- multinom(salary_category ~ gpa + gender_Female + gender_Male + college_tier +
-                          stream_Information.Technology,data = salary_train, maxit = 1000)
-
-tidy(final_model)
-
-```
-
-### Model Accuracy
-```{r}
-final_predictions <- predict(final_model, newdata = salary_test)
-final_confusion_matrix <- confusionMatrix(final_predictions, salary_test$salary_category)
-#print(final_confusion_matrix)
-
-# AIC comparison
-full_model_aic <- AIC(full_model)
-final_model_aic <- AIC(final_model)
-cat("Full model AIC:", full_model_aic, "\n")
-cat("Final model AIC:", final_model_aic, "\n")
-
-```
-
-### Visualize final model predictions on Test Data
-```{r}
-test_results <- data.frame(
-  actual = salary_test$salary_category,
-  predicted = final_predictions
-)
-
-test_probs <- predict(final_model, newdata = salary_test, type = "probs")
-test_results <- cbind(test_results, test_probs)
-
-cat("Accuracy:", final_confusion_matrix$overall["Accuracy"], "\n")
-```
-
-The accuracy score of 63.16% suggests that the variables (GPA, gender, college tier, and IT specialization) capture meaningful patterns in determining salary outcomes
-
+GPA has a significant negative association with being in the low salary group (p=0.002), suggesting that higher GPAs reduce the likelihood of receiving a lower starting salary. Both gender categories showed strong positive effects, indicating certain gender-related patterns in salary distribution. All engineering streams demonstrated significant positive coefficients, with Electrical Engineering having the strongest impact (p<0.0001). Years of experience was not statistically significant for the low salary group (p=0.219). The model's performance metrics with an accuracy (66.2%) but a strong ROC AUC (0.802), indicating good discriminative ability between salary categories. 
 
 # Introducing an interaction term for the Multinomial Model
 We will introduce interaction terms to allow us to capture more complex relationships between predictors that may significantly influence salary outcomes. 
 
 ```{r}
-salary_train <- salary_train %>%
-  mutate(salary_category = case_when(
-    salary < quantile(salary, 0.33) ~ "low",
-    salary >= quantile(salary, 0.33) & salary < quantile(salary, 0.66) ~ "medium",
-    salary >= quantile(salary, 0.66) ~ "high"
-  ))
-
-salary_test <- salary_test %>%
-  mutate(salary_category = case_when(
-    salary < quantile(salary_train$salary, 0.33) ~ "low",
-    salary >= quantile(salary_train$salary, 0.33) & salary < quantile(salary_train$salary, 0.66) ~ "medium",
-    salary >= quantile(salary_train$salary, 0.66) ~ "high"
-  ))
-
-# Convert to factor
-salary_train$salary_category <- factor(salary_train$salary_category)
-salary_test$salary_category <- factor(salary_test$salary_category)
-
-# base model without interactions
-base_model <- multinom(salary_category ~ gpa + gender_Female + gender_Male + college_tier +
-                          stream_Information.Technology,data = salary_train, maxit = 1000)
-
-# 1. GPA and College Tier interaction
-model_gpa_tier <- multinom(salary_category ~ gpa + years_of_experience + 
-                             gender_Female + gender_Male + 
-                             stream_Computer.Science + stream_Electrical.Engineering + 
-                             stream_Electronics.and.Communication + stream_Information.Technology + 
-                             stream_Mechanical.Engineering + 
-                             college_tier + gpa:college_tier, 
-                           data = salary_train, 
-                           maxit = 1000)
-
-# 2. Experience and Stream interaction
-model_exp_stream <- multinom(salary_category ~ gpa + years_of_experience + 
-                               gender_Female + gender_Male + 
-                               stream_Computer.Science + stream_Electrical.Engineering + 
-                               stream_Electronics.and.Communication + stream_Information.Technology + 
-                               stream_Mechanical.Engineering + 
-                               college_tier + years_of_experience:stream_Computer.Science, 
-                             data = salary_train, 
-                             maxit = 1000)
-
-# 3. Gender and Stream interaction
-model_gender_stream <- multinom(salary_category ~ gpa + years_of_experience + 
-                                  gender_Female + gender_Male + 
-                                  stream_Computer.Science + stream_Electrical.Engineering + 
-                                  stream_Electronics.and.Communication + stream_Information.Technology + 
-                                  stream_Mechanical.Engineering + 
-                                  college_tier + gender_Female:stream_Computer.Science, 
-                                data = salary_train, 
-                                maxit = 1000)
-
-# Compare models using AIC
-models_aic <- data.frame(
-  Model = c("Base Model", "GPA x College Tier", "Experience x Stream", "Gender x Stream"),
-  AIC = c(AIC(base_model), AIC(model_gpa_tier), AIC(model_exp_stream), AIC(model_gender_stream))
-)
-print(models_aic)
-
-```
-**Test the significance of the interaction terms using likelihood ratio tests**
-
-```{r}
-lrt_gpa_tier <- anova(base_model, model_gpa_tier)
-lrt_exp_stream <- anova(base_model, model_exp_stream)
-lrt_gender_stream <- anova(base_model, model_gender_stream)
-
-print("Likelihood ratio test for GPA x College Tier interaction:")
-print(lrt_gpa_tier)
-print("Likelihood ratio test for Experience x Stream interaction:")
-print(lrt_exp_stream)
-print("Likelihood ratio test for Gender x Stream interaction:")
-print(lrt_gender_stream)
-```
-
-### Evaluate prediction accuracy for each model
-We will now evaluate the prediction accuracy for each model based on the interaction terms used
-```{r}
-evaluate_model <- function(model, test_data) {
-  predictions <- predict(model, newdata = test_data)
-  conf_matrix <- confusionMatrix(predictions, test_data$salary_category)
-  return(conf_matrix$overall["Accuracy"])
-}
-
-model_accuracies <- data.frame(
-  Model = c("Base Model", "GPA x College Tier", "Experience x Stream", "Gender x Stream"),
-  Accuracy = c(
-    evaluate_model(base_model, salary_test),
-    evaluate_model(model_gpa_tier, salary_test),
-    evaluate_model(model_exp_stream, salary_test),
-    evaluate_model(model_gender_stream, salary_test)
+# Adding interaction terms to the full model
+interaction_model_fit <- multinom_spec %>%
+  fit(
+    salary_category ~ gpa + years_of_experience + 
+      gender_Female + gender_Male + 
+      stream_Computer.Science + stream_Electrical.Engineering + 
+      stream_Electronics.and.Communication + stream_Information.Technology + 
+      stream_Mechanical.Engineering + 
+      college_tier +
+      gpa:years_of_experience +                  
+      gpa:college_tier +                        
+      years_of_experience:college_tier +        
+      gender_Female:stream_Computer.Science +   
+      gender_Male:stream_Computer.Science,      
+    data = salary_train
   )
+
+tidy(interaction_model_fit)
+
+interaction_predictions <- interaction_model_fit %>%
+  predict(new_data = salary_test) %>%
+  pull(.pred_class)
+
+
+# Cross-validation for the interaction model
+cv_results_interaction <- fit_resamples(
+  multinom_spec,
+  salary_category ~ gpa + years_of_experience + 
+    gender_Female + gender_Male + 
+    stream_Computer.Science + stream_Electrical.Engineering + 
+    stream_Electronics.and.Communication + stream_Information.Technology + 
+    stream_Mechanical.Engineering + 
+    college_tier +
+    gpa:years_of_experience +
+    gpa:college_tier +
+    years_of_experience:college_tier,
+  resamples = salary_folds,
+  metrics = metric_set(accuracy, roc_auc),
+  control = control_resamples(save_pred = TRUE)
 )
-print(model_accuracies)
 
-
+# Compare CV metrics
+collect_metrics(cv_results) %>% 
+  mutate(model = "Without Interactions") %>%
+  bind_rows(
+    collect_metrics(cv_results_interaction) %>% 
+      mutate(model = "With Interactions")
+  ) %>%
+  arrange(.metric, model)
 ```
+For accuracy, the model with interactions (65.9%) performs marginally worse than the model without interactions (66.2%), this shows that interaction terms don't meaningfully improve the model's predictive capability for classifying salary categories.
 
-### Model with all the Significant Interactions
+## Comparing Lasso and Ridge Regression 
+we will use lasso and ridge regression to check if the perfomance of the model can improve
 
 ```{r}
-comprehensive_model <- multinom(salary_category ~ gpa + gender_Female + gender_Male + stream_Computer.Science + stream_Electrical.Engineering + 
-                                  stream_Electronics.and.Communication + stream_Information.Technology + stream_Mechanical.Engineering + 
-                                  college_tier + years_of_experience +
-                                  gpa:college_tier + 
-                                  years_of_experience:stream_Computer.Science +
-                                  gender_Female:stream_Computer.Science, data = salary_train,maxit = 1000)
+set.seed(2025)
 
-comprehensive_accuracy <- evaluate_model(comprehensive_model, salary_test)
-print(paste("Comprehensive model accuracy:", comprehensive_accuracy))
+salary_recipe <- recipe(
+  salary_category ~ gpa + years_of_experience + 
+    gender_Female + gender_Male + 
+    stream_Computer.Science + stream_Electrical.Engineering + 
+    stream_Electronics.and.Communication + stream_Information.Technology + 
+    stream_Mechanical.Engineering + 
+    college_tier,
+  data = salary_train
+) %>%
+  # Convert ordered factor to numeric
+  step_ordinalscore(college_tier) %>%
+  # Normalize all predictors (important for regularization)
+  step_normalize(all_predictors())
 
+penalty_grid <- grid_regular(
+  penalty(range = c(-3, 0), trans = log10_trans()),
+  levels = 10
+)
+
+# Ridge model specification
+ridge_spec <- multinom_reg(
+  penalty = tune(),
+  mixture = 0  # Ridge regression (L2 penalty)
+) %>%
+  set_engine("glmnet") %>%
+  set_mode("classification")
+
+# Lasso model specification
+lasso_spec <- multinom_reg(
+  penalty = tune(),
+  mixture = 1  # Lasso regression (L1 penalty)
+) %>%
+  set_engine("glmnet") %>%
+  set_mode("classification")
+
+ridge_wf <- workflow() %>%
+  add_recipe(salary_recipe) %>%
+  add_model(ridge_spec)
+
+lasso_wf <- workflow() %>%
+  add_recipe(salary_recipe) %>%
+  add_model(lasso_spec)
+
+# Set up cross-validation
+set.seed(2025)
+salary_folds <- vfold_cv(salary_train, v = 5)
+
+# Tune ridge model
+ridge_results <- tune_grid(
+  ridge_wf,
+  resamples = salary_folds,
+  grid = penalty_grid,
+  metrics = metric_set(accuracy, roc_auc)
+)
+
+# Tune lasso model
+lasso_results <- tune_grid(
+  lasso_wf,
+  resamples = salary_folds,
+  grid = penalty_grid,
+  metrics = metric_set(accuracy, roc_auc)
+)
+
+ridge_metrics <- collect_metrics(ridge_results) %>%
+  mutate(model = "Ridge")
+
+lasso_metrics <- collect_metrics(lasso_results) %>%
+  mutate(model = "Lasso")
+
+combined_metrics <- bind_rows(ridge_metrics, lasso_metrics)
+
+# Select best hyperparameters
+best_ridge <- select_best(ridge_results, metric = "accuracy")
+best_lasso <- select_best(lasso_results, metric = "accuracy")
+
+final_ridge_wf <- ridge_wf %>%
+  finalize_workflow(best_ridge)
+
+final_lasso_wf <- lasso_wf %>%
+  finalize_workflow(best_lasso)
+
+# Fit final models
+final_ridge_fit <- final_ridge_wf %>%
+  fit(data = salary_train)
+
+final_lasso_fit <- final_lasso_wf %>%
+  fit(data = salary_train)
+
+# Make predictions
+ridge_predictions <- final_ridge_fit %>%
+  predict(new_data = salary_test) %>%
+  pull(.pred_class)
+
+lasso_predictions <- final_lasso_fit %>%
+  predict(new_data = salary_test) %>%
+  pull(.pred_class)
+
+ridge_acc <- accuracy(
+  data = data.frame(truth = salary_test$salary_category, estimate = ridge_predictions),
+  truth = truth,
+  estimate = estimate
+)
+
+lasso_acc <- accuracy(
+  data = data.frame(truth = salary_test$salary_category, estimate = lasso_predictions),
+  truth = truth,
+  estimate = estimate
+)
+
+# compare the models
+  model_comparison <- bind_rows(
+  ridge_acc %>% mutate(model = "Ridge"),
+  lasso_acc %>% mutate(model = "Lasso"))
+
+  model_comparison %>%
+  pivot_wider(names_from = model, values_from = .estimate) %>%
+  arrange(.metric)
+
+# Extract and compare coefficients
+ridge_coefs <- tidy(final_ridge_fit) %>%
+  mutate(model = "Ridge")
+
+lasso_coefs <- tidy(final_lasso_fit) %>%
+  mutate(model = "Lasso")
+
+all_coefs <- bind_rows(ridge_coefs, lasso_coefs)
+
+# Visualize coefficients for one outcome level
+ggplot(all_coefs %>% filter(class == "high"), 
+       aes(x = term, y = estimate, fill = model)) +
+  geom_col(position = "dodge") +
+  coord_flip() +
+  labs(title = "Coefficient Comparison for 'High' Salary Category",
+       x = "Predictors",
+       y = "Coefficient Estimates") +
+  theme_minimal()
+
+# Variable importance for both models
+vip_ridge <- extract_fit_engine(final_ridge_fit) %>%
+  vi(lambda = best_ridge$penalty) %>%
+  mutate(model = "Ridge")
+
+vip_lasso <- extract_fit_engine(final_lasso_fit) %>%
+  vi(lambda = best_lasso$penalty) %>%
+  mutate(model = "Lasso")
+
+# Compare variable importance
+bind_rows(vip_ridge, vip_lasso) %>%
+  group_by(model) %>%
+  top_n(10, Importance) %>%
+  ungroup() %>%
+  ggplot(aes(x = reorder(Variable, Importance), y = Importance, fill = model)) +
+  geom_col(position = "dodge") +
+  coord_flip() +
+  facet_wrap(~model, scales = "free_y") +
+  labs(title = "Top 10 Variables by Importance",
+       x = NULL) +
+  theme_minimal()
 
 ```
-The incorporation of interaction terms into our multinomial logistic regression model has substantially enhanced our predictive capabilities, as seen by the improvement in accuracy from 63.16% to 75.44%. This shows that salary determination is governed by complex interrelationships
-
-
-```{r}
-best_model <- comprehensive_model 
-coefficients <- coef(best_model)
-print(coefficients)
-
-plot_key_coefficients <- function(model) {
-  coefs <- coef(model)
-  
-  coef_data <- data.frame()
-  for (i in 1:nrow(coefs)) {
-    category <- rownames(coefs)[i]
-    temp <- data.frame(
-      Category = category,
-      Variable = colnames(coefs),
-      Coefficient = as.numeric(coefs[i,])
-    )
-    coef_data <- rbind(coef_data, temp)
-  }
-  
-  interaction_terms <- coef_data[grep(":", coef_data$Variable), ]
-  
-  print("Interaction term coefficients:")
-  print(interaction_terms)
-  
-  return(interaction_terms)
-}
-
-interaction_coefficients <- plot_key_coefficients(best_model)
-
-#cat("\nAIC:", AIC(best_model), "\n")
-cat("Accuracy:", evaluate_model(best_model, salary_test), "\n")
-
-
-```
+The results from Ridge and Lasso regularization demonstrate remarkable consistency and improvement in model performance, with both techniques achieving identical accuracy scores of 72.8%. This represents a substantial increase from the previous models' accuracy of approximately 66%, indicating that regularization effectively addressed potential overfitting issues in the original models. The identical performance between Ridge and Lasso suggests that both approaches identified similar patterns in the data and applied comparable levels of feature penalization.
+This can be confirmed from the variable importance plots from both Lasso and Ridge regularization models that reveal a consistent pattern in the factors that best predict graduate starting salaries.
 
 # 4. Linear Discriminant Analysis
 
 ## Research Question 3
-**How does feature selection through regularization improve generalization to new graduate data for job placement?**
+**What factors contribute most to the classification of graduate job placement outcomes using Linear Discriminant Analysis?**
 ```{r}
+data_mod <- job_processed %>%
+  dplyr::select(-college_name) %>%
+  dplyr::select(placement, age, gpa, years_of_experience, college_tier, 
+                starts_with("gender_"), starts_with("stream_"))
+
 set.seed(2025)
-job_split <- initial_split(job_processed, prop = 0.8, strata = placement)
-job_train <- training(job_split)
-job_test <- testing(job_split)
-
-job_train$placement <- factor(job_train$placement, levels = c(0, 1), 
-                            labels = c("Not Placed", "Placed"))
-job_test$placement <- factor(job_test$placement, levels = c(0, 1), 
-                           labels = c("Not Placed", "Placed"))
+job_split <- initial_split(data_mod, prop = 0.8, strata = placement)
+train_data <- training(job_split)
+test_data <- testing(job_split)
 
 
+if(!is.factor(train_data$placement)) {
+  train_data <- train_data %>%
+    mutate(placement = factor(placement, 
+                             levels = c(0, 1),
+                             labels = c("Not Placed", "Placed")))
+  
+  test_data <- test_data %>%
+    mutate(placement = factor(placement, 
+                            levels = c(0, 1),
+                            labels = c("Not Placed", "Placed")))
+}
+
+# Create formula for LDA
+predictors <- setdiff(names(train_data), "placement")
 lda_formula <- as.formula(paste("placement ~", paste(predictors, collapse = " + ")))
 
-lda_model <- lda(lda_formula, data = job_train)
+lda_model <- lda(lda_formula, data = train_data)
 
-print(lda_model)
+train_predictions <- predict(lda_model, train_data)
 
-cat("\nPRIOR PROBABILITIES:\n")
-print(lda_model$prior)
-
-cat("\nGROUP MEANS:\n")
-print(lda_model$means)
-```
-The Linear Discriminant Analysis reveals several key insights into factors influencing job placement outcomes. `Years of experience` emerges as a critical positive predictor (coefficient 1.55), suggesting employers strongly value practical experience. `Higher-tier colleges` (coefficient 1.60) substantially improve placement prospects, highlighting the importance of institutional reputation in hiring decisions. Interestingly, the negative coefficient for `GPA` (-1.92) that contradicts conventional expectations, possibly reflecting complex interactions with other variables or specific industry preferences beyond academic performance alone. The analysis further identifies Electronics and Communication (0.38) and Information Technology (0.34) as the most advantageous specializations for placement, while Computer Science unexpectedly shows a negative association (-0.43).
-
-## Making Predictions 
-```{r}
-lda_values <- predict(lda_model, job_train)
-
-lda_data <- data.frame(
-  LD1 = lda_values$x,
-  placement = job_train$placement
+lda_data <- tibble(
+  LD1 = train_predictions$x,
+  placement = train_data$placement
 )
+```
+**Make Predictions on test data and plotting density status**
 
+```{r}
 ggplot(lda_data, aes(x = LD1, fill = placement)) +
   geom_density(alpha = 0.5) +
   labs(title = "Linear Discriminant Values by Placement Status",
@@ -895,80 +948,35 @@ ggplot(lda_data, aes(x = LD1, fill = placement)) +
   theme_minimal() +
   scale_fill_brewer(palette = "Set1")
 
-```
+test_predictions <- predict(lda_model, test_data)
 
+posterior_colnames <- colnames(test_predictions$posterior)
+placement_col <- posterior_colnames[length(posterior_colnames)] 
 
-```{r}
-lda_pred <- predict(lda_model, job_test)
-test_pred <- lda_pred$class
-test_probabilities <- lda_pred$posterior[, "Placed"]
-
-predictions_df <- data.frame(
-  actual = job_test$placement,
-  predicted = test_pred,
-  probability = test_probabilities
+predictions_df <- tibble(
+  actual = test_data$placement,
+  predicted = test_predictions$class,
+  probability = test_predictions$posterior[, placement_col]
 )
 
+conf_matrix <- confusionMatrix(predictions_df$predicted, predictions_df$actual)
 
-conf_matrix <- confusionMatrix(test_pred, job_test$placement)
-#cat("\nCONFUSION MATRIX:\n")
-#print(conf_matrix)
+cat("Accuracy:", conf_matrix$overall["Accuracy"], "\n")
+cat("Sensitivity (TPR):", conf_matrix$byClass["Sensitivity"], "\n")
+cat("Specificity (TNR):", conf_matrix$byClass["Specificity"], "\n")
 
-accuracy <- conf_matrix$overall["Accuracy"]
-sensitivity <- conf_matrix$byClass["Sensitivity"] 
-specificity <- conf_matrix$byClass["Specificity"] 
-
-cat("Accuracy:", accuracy, "\n")
-cat("Sensitivity (TPR):", sensitivity, "\n")
-cat("Specificity (TNR):", specificity, "\n")
-
-if(require(pROC)) {
-  roc_curve <- roc(job_test$placement, test_probabilities)
-  auc_value <- auc(roc_curve)
-  
-  cat("AUC:", auc_value, "\n")
-  
-  plot(roc_curve, main = "ROC Curve for LDA Model",
-       col = "blue", lwd = 2)
-  abline(a = 0, b = 1, lty = 2, col = "red")
-}
-
-
-```
-The area under the curve estimated between 0.7-0.8, the model exhibits moderate predictive power. This  model has meaningful predictive power for distinguishing between `placed` and `not placed` students, but there remains some overlap between the groups that prevents perfect classification. The model appears to be reasonably well-balanced between sensitivity and specificity, making it a useful tool for predicting placement outcomes based on the selected variables.
-
-## Feature Importance for the model
-```{r}
-
-lda_importance <- abs(lda_model$scaling)
-lda_importance_df <- data.frame(
-  Variable = rownames(lda_importance),
-  Importance = lda_importance[,1]
-) %>%
-  arrange(desc(Importance))
-
-ggplot(lda_importance_df, aes(x = reorder(Variable, Importance), y = Importance)) +
-  geom_bar(stat = "identity", fill = "darkgreen") +
-  coord_flip() +
-  labs(title = "Feature Importance in LDA Model",
-       x = "Variable",
-       y = "Absolute Coefficient Value") +
-  theme_minimal()
-
-
-```
-
-GPA is the most influential predictor with the highest absolute coefficient value (around 1.9), followed by college tier O (around 1.6) and years of experience (approximately 1.5). Age appears to be the least influential factor for placement with a negligible coefficent value.
-
-**Compare with misclassified observations**
-```{r}
 
 misclassified <- predictions_df %>%
   filter(actual != predicted)
 
 if(nrow(misclassified) > 0) {
-  misclassified_data <- job_test[rownames(misclassified), c(predictors, "placement")]
+  # Get indices of misclassified observations
+  misclassified_indices <- which(predictions_df$actual != predictions_df$predicted)
   
+  # Extract misclassified data
+  misclassified_data <- test_data[misclassified_indices, ]
+  
+  # Summarize misclassified observations
   misclassified_summary <- misclassified_data %>%
     group_by(placement) %>%
     summarize(
@@ -980,87 +988,96 @@ if(nrow(misclassified) > 0) {
   
   print(misclassified_summary)
 }
-
 ```
-## compare LDA with logistic regression
-```{r}
-logistic_model <- glm(lda_formula, family = binomial, data = job_train)
 
-logistic_probs <- predict(logistic_model, newdata = job_test, type = "response")
-logistic_preds <- ifelse(logistic_probs > 0.5, "Placed", "Not Placed") %>%
-  factor(levels = c("Not Placed", "Placed"))
+The linear discriminant analysis model achieved a respectable accuracy of 79.3%, demonstrating its effectiveness in distinguishing between placed and non-placed graduates
+The density plot reveals clear separation between the two groups, with not-placed students concentrated on the negative side of the discriminant axis and placed students primarily on the positive side
 
-logistic_conf <- confusionMatrix(logistic_preds, job_test$placement)
 
-model_comparison <- data.frame(
-  Model = c("LDA", "Logistic Regression"),
-  Accuracy = c(accuracy, logistic_conf$overall["Accuracy"]),
-  Sensitivity = c(sensitivity, logistic_conf$byClass["Sensitivity"]),
-  Specificity = c(specificity, logistic_conf$byClass["Specificity"])
-)
-
-print(model_comparison)
-```
-The LDA model achieves a slightly higher overall accuracy (79.3%) compared to Logistic Regression (78.6%), indicating it correctly classifies a marginally larger proportion of cases. The low sensitivity values for both models suggest they struggle significantly with identifying positive placement cases, while the high specificity indicates they're much more reliable at identifying non-placement cases.
 
 # 5. Polynomial Regression
 
 ## Research Question 4
 **To what extent does the relationship between academic performance (GPA) and starting salary exhibit nonlinear patterns, and how do these nonlinear effects interact with years of experience and field of study to predict graduate salary outcomes?**
-```{r}
-n_unique_gpa <- length(unique(placed_grads$gpa))
-n_unique_exp <- length(unique(placed_grads$years_of_experience))
 
-evaluate_poly_model <- function(target_degree) {
+```{r}
+evaluate_poly_model_tidy <- function(target_degree, data = placed_grads) {
+  # Calculate maximum polynomial degrees based on unique values
+  n_unique_gpa <- length(unique(data$gpa))
+  n_unique_exp <- length(unique(data$years_of_experience))
+  
   max_gpa_degree <- min(n_unique_gpa - 1, target_degree)
   max_exp_degree <- min(n_unique_exp - 1, target_degree)
-  
   
   max_gpa_degree <- max(1, max_gpa_degree)
   max_exp_degree <- max(1, max_exp_degree)
   
-  formula_str <- paste0("salary ~ poly(gpa, ", max_gpa_degree, 
-                       ") + poly(years_of_experience, ", max_exp_degree, 
-                       ") + gender_Male + stream_Computer.Science + stream_Electrical.Engineering + college_tier+ gpa_cat +
-                       stream_Electronics.and.Communication + stream_Information.Technology")
+  model_recipe <- recipe(salary ~ gpa + years_of_experience + gender_Male + 
+                         stream_Computer.Science + stream_Electrical.Engineering + 
+                         college_tier + gpa_cat + stream_Electronics.and.Communication + 
+                         stream_Information.Technology, 
+                         data = data) %>%
+    step_poly(gpa, degree = max_gpa_degree) %>%
+    step_poly(years_of_experience, degree = max_exp_degree)
   
-  model <- lm(as.formula(formula_str), data = placed_grads)
+  lin_reg_spec <- linear_reg() %>%
+    set_engine("lm") %>%
+    set_mode("regression")
   
-
-  rmse <- sqrt(mean(model$residuals^2))
-  r_squared <- summary(model)$r.squared
-  adj_r_squared <- summary(model)$adj.r.squared
+  # Create workflow combining recipe and model
+  poly_workflow <- workflow() %>%
+    add_recipe(model_recipe) %>%
+    add_model(lin_reg_spec)
   
-
-    return(list(
+  poly_fit <- poly_workflow %>%
+    fit(data = data)
+  
+  model_fit <- poly_fit %>% extract_fit_parsnip()
+  model <- model_fit$fit
+  
+  predictions <- predict(poly_fit, new_data = data)
+  rmse_val <- rmse(bind_cols(data, predictions), truth = salary, estimate = .pred)$.estimate
+  
+  r_squared <- glance(model)$r.squared
+  adj_r_squared <- glance(model)$adj.r.squared
+  
+  # Return results
+  return(list(
+    workflow = poly_fit,
     model = model,
     summary = summary(model),
-    formula = formula_str,
-    metrics = data.frame(
-      gpa_degree = max_gpa_degree, 
+    recipe = model_recipe,
+    metrics = tibble(
+      gpa_degree = max_gpa_degree,
       exp_degree = max_exp_degree,
-      rmse = rmse,
+      rmse = rmse_val,
       r_squared = r_squared,
       adj_r_squared = adj_r_squared
     )
   ))
 }
 
-poly_results <- lapply(1:3, evaluate_poly_model)
+# Evaluate models with degrees 1 to 3
+poly_results_tidy <- map(1:3, evaluate_poly_model_tidy)
 
-poly_metrics <- bind_rows(lapply(poly_results, function(x) x$metrics))
-print(poly_metrics)
+poly_metrics_tidy <- map_dfr(poly_results_tidy, ~ .x$metrics)
+print(poly_metrics_tidy)
 
-best_model_idx <- which.max(poly_metrics$adj_r_squared)
-best_poly_model <- poly_results[[best_model_idx]]$model
+# Find best model
+best_model_idx <- which.max(poly_metrics_tidy$adj_r_squared)
+best_poly_workflow <- poly_results_tidy[[best_model_idx]]$workflow
+best_poly_model <- poly_results_tidy[[best_model_idx]]$model
 
 cat("Best polynomial model:\n")
-cat(poly_results[[best_model_idx]]$formula, "\n\n")
-summary(best_poly_model)
+print(poly_results_tidy[[best_model_idx]]$recipe)
+cat("\n")
+tidy(best_poly_model)
+glance(best_poly_model)
 
-# Using the degree from the best model
-best_gpa_degree <- poly_metrics$gpa_degree[best_model_idx]
+# Plot relationship using degree from best model
+best_gpa_degree <- poly_metrics_tidy$gpa_degree[best_model_idx]
 
+# Create plot
 ggplot(placed_grads, aes(x = gpa, y = salary)) +
   geom_point(alpha = 0.5) +
   geom_smooth(method = "lm", 
@@ -1071,13 +1088,21 @@ ggplot(placed_grads, aes(x = gpa, y = salary)) +
        y = "Salary ($)") +
   theme_minimal()
 
-base_model <- lm(salary ~ gpa + years_of_experience + gender_Male + 
-                stream_Computer.Science + stream_Electrical.Engineering + 
-                stream_Electronics.and.Communication + stream_Information.Technology, 
-                data = placed_grads)
+base_recipe <- recipe(salary ~ gpa + years_of_experience + gender_Male + 
+                      stream_Computer.Science + stream_Electrical.Engineering + 
+                      stream_Electronics.and.Communication + stream_Information.Technology, 
+                      data = placed_grads)
 
-anova(base_model, best_poly_model)
+base_workflow <- workflow() %>%
+  add_recipe(base_recipe) %>%
+  add_model(lin_reg_spec) %>%
+  fit(data = placed_grads)
+
+base_model_tidy <- extract_fit_parsnip(base_workflow)$fit
+
+#anova(base_model_tidy, best_poly_model)
 ```
+
 The polynomial regression analysis reveals strong evidence for nonlinear relationships between academic performance and starting salary outcomes. Comparing model performance across different polynomial degrees demonstrates that a quadratic relationship (degree 2) substantially outperforms the linear model, with R-squared increasing from 0.369 to 0.468—indicating that nonlinear terms explain approximately 10% more variance in salary outcomes. This improvement is also supported by a significant reduction in prediction error, with RMSE decreasing from 1785.31 to 1638.73. The negligible improvement when advancing to a cubic model (R-squared of 0.470 versus 0.468) suggests that a quadratic function adequately captures the relationship's nonlinearity, with the adjusted R-squared values confirming these improvements aren't merely artifacts of additional parameters. These findings strongly indicate that the GPA-salary relationship follows a curvilinear pattern, where the marginal returns of increasing GPA may vary at different performance levels.
 
 
